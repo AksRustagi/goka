@@ -1,4 +1,4 @@
-package mock
+package tester
 
 import (
 	"context"
@@ -187,6 +187,10 @@ func (cg *ConsumerGroup) markMessage(msg *sarama.ConsumerMessage) {
 func (cg *ConsumerGroup) Consume(ctx context.Context, topics []string, handler sarama.ConsumerGroupHandler) error {
 	if cg.failOnConsume != nil {
 		return cg.failOnConsume
+	}
+
+	if len(topics) == 0 {
+		return fmt.Errorf("no topics specified")
 	}
 
 	key := cg.topicKey(topics)

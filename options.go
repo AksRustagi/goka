@@ -199,7 +199,7 @@ type Tester interface {
 	TopicManagerBuilder() TopicManagerBuilder
 	RegisterGroupGraph(*GroupGraph) string
 	RegisterEmitter(Stream, Codec)
-	RegisterView(Table, Codec)
+	RegisterView(Table, Codec) string
 }
 
 // WithTester configures all external connections of a processor, ie, storage,
@@ -349,7 +349,7 @@ func WithViewTester(t Tester) ViewOption {
 		o.builders.storage = t.StorageBuilder()
 		o.builders.topicmgr = t.TopicManagerBuilder()
 		o.partitionChannelSize = 0
-		t.RegisterView(table, codec)
+		o.clientID = t.RegisterView(table, codec)
 	}
 }
 

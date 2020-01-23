@@ -270,7 +270,7 @@ func (p *PartitionTable) load(ctx context.Context, stopAfterCatchup bool) (rerr 
 	defer p.stats.reset()
 
 	// consume errors asynchronously
-	go p.handleConsumerErrors(ctx, partConsumer)
+	go p.handleConsumerErrors(ctx, errs, partConsumer)
 
 	// load messages and stop when you're at HWM
 	loadErr := p.loadMessages(ctx, partConsumer, partitionHwm, stopAfterCatchup)
@@ -321,14 +321,16 @@ func (p *PartitionTable) markRecovered(ctx context.Context) error {
 	}
 }
 
-func (p *PartitionTable) handleConsumerErrors(ctx context.Context, cons sarama.PartitionConsumer) {
+func (p *PartitionTable) handleConsumerErrors(ctx context.Context, errs *multierr.Errors, cons sarama.PartitionConsumer) {
 	for {
 		select {
 		case consError, ok := <-cons.Errors():
 			if !ok {
 				return
 			}
-			p.log.Printf("Consumer error for table/partition %s/%d: %v", p.topic, p.partition, consError)
+			err := fmt.Errorf("Consumer error: %v", consError)
+			p.log.Printf("%v", err)
+			errs.Collect(err)
 		case <-ctx.Done():
 			return
 		}
