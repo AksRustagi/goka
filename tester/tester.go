@@ -314,6 +314,9 @@ func (tt *Tester) codecForTopic(topic string) goka.Codec {
 }
 
 func (tt *Tester) registerCodec(topic string, codec goka.Codec) {
+	// create a queue, we're going to need it anyway
+	tt.getOrCreateQueue(topic)
+
 	if existingCodec, exists := tt.codecs[topic]; exists {
 		if reflect.TypeOf(codec) != reflect.TypeOf(existingCodec) {
 			panic(fmt.Errorf("There are different codecs for the same topic. This is messed up (%#v, %#v)", codec, existingCodec))
