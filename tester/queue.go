@@ -49,6 +49,12 @@ func (q *queue) message(offset int) *message {
 	return q.messages[offset]
 }
 
+func (q *queue) messagesFromOffset(offset int64) []*message {
+	q.Lock()
+	defer q.Unlock()
+	return q.messages[offset:]
+}
+
 func (q *queue) size() int {
 	q.Lock()
 	defer q.Unlock()

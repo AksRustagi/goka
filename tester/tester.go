@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/lovoo/goka"
 	"github.com/lovoo/goka/storage"
@@ -41,10 +42,26 @@ type client struct {
 	clientID      string
 	consumerGroup *ConsumerGroup
 	consumer      *consumerMock
+}
 
-	expectGroup bool
-	// list of topics where we expect consumers for
-	expectedConsumers []string
+func (c *client) waitStartup() {
+	if c.consumerGroup != nil {
+		c.consumerGroup.WaitRunning()
+	}
+
+	c.consumer.waitRequiredConsumersStartup()
+}
+
+func (c *client) requireConsumer(topic string) {
+	c.consumer.requirePartConsumer(topic)
+}
+
+func (c *client) catchup() int {
+	catchup := c.consumerGroup.catchupAndWait()
+
+	catchup += c.consumer.catchup()
+
+	return catchup
 }
 
 type queuedMessage struct {
@@ -58,10 +75,11 @@ type Tester struct {
 	producer *producerMock
 	tmgr     goka.TopicManager
 
-	clients map[string]*client
+	mClients sync.RWMutex
+	clients  map[string]*client
 
 	codecs      map[string]goka.Codec
-	mQueues     sync.RWMutex
+	mQueues     sync.Mutex
 	topicQueues map[string]*queue
 	storages    map[string]storage.Storage
 
@@ -71,8 +89,7 @@ type Tester struct {
 func New(t *testing.T) *Tester {
 
 	tt := &Tester{
-		t:    t,
-		tmgr: NewMockTopicManager(1, 1),
+		t: t,
 
 		clients: make(map[string]*client),
 
@@ -80,13 +97,15 @@ func New(t *testing.T) *Tester {
 		topicQueues: make(map[string]*queue),
 		storages:    make(map[string]storage.Storage),
 	}
-
+	tt.tmgr = NewMockTopicManager(tt, 1, 1)
 	tt.producer = newProducerMock(tt.handleEmit)
 
 	return tt
 }
 
 func (tt *Tester) nextClient() *client {
+	tt.mClients.Lock()
+	defer tt.mClients.Unlock()
 	c := &client{
 		clientID:      fmt.Sprintf("client-%d", len(tt.clients)),
 		consumer:      newConsumerMock(tt),
@@ -98,6 +117,8 @@ func (tt *Tester) nextClient() *client {
 
 func (tt *Tester) ConsumerGroupBuilder() goka.ConsumerGroupBuilder {
 	return func(brokers []string, group, clientID string) (sarama.ConsumerGroup, error) {
+		tt.mClients.RLock()
+		defer tt.mClients.RUnlock()
 		client, exists := tt.clients[clientID]
 		if !exists {
 			return nil, fmt.Errorf("cannot create consumergroup because no client registered with ID: %s", clientID)
@@ -113,6 +134,9 @@ func (tt *Tester) ConsumerGroupBuilder() goka.ConsumerGroupBuilder {
 
 func (tt *Tester) ConsumerBuilder() goka.SaramaConsumerBuilder {
 	return func(brokers []string, clientID string) (sarama.Consumer, error) {
+		tt.mClients.RLock()
+		defer tt.mClients.RUnlock()
+
 		client, exists := tt.clients[clientID]
 		if !exists {
 			return nil, fmt.Errorf("cannot create sarama consumer because no client registered with ID: %s", clientID)
@@ -145,10 +169,12 @@ func (tt *Tester) handleEmit(topic string, key string, value []byte) *goka.Promi
 }
 
 func (tt *Tester) pushMessage(topic string, key string, data []byte) {
-	tt.queuedMessages = append(tt.queuedMessages, &queuedMessage{topic: topic, key: key, value: data})
+
+	tt.getOrCreateQueue(topic).push(key, data)
 }
 
 type consumerMock struct {
+	sync.RWMutex
 	tester         *Tester
 	requiredTopics map[string]bool
 	partConsumers  map[string]*partConsumerMock
@@ -162,6 +188,17 @@ func newConsumerMock(tt *Tester) *consumerMock {
 	}
 }
 
+func (cm *consumerMock) catchup() int {
+	cm.RLock()
+	defer cm.RUnlock()
+	var catchup int
+	for _, pc := range cm.partConsumers {
+		catchup += pc.catchup()
+		return catchup
+	}
+	return catchup
+}
+
 func (cm *consumerMock) Topics() ([]string, error) {
 	return nil, fmt.Errorf("Not implemented")
 }
@@ -171,14 +208,19 @@ func (cm *consumerMock) Partitions(topic string) ([]int32, error) {
 }
 
 func (cm *consumerMock) ConsumePartition(topic string, partition int32, offset int64) (sarama.PartitionConsumer, error) {
+	cm.Lock()
+	defer cm.Unlock()
 	if _, exists := cm.partConsumers[topic]; exists {
 		return nil, fmt.Errorf("Got duplicate consume partition for topic %s", topic)
 	}
 	cons := &partConsumerMock{
+		offset:   offset,
 		queue:    cm.tester.getOrCreateQueue(topic),
 		messages: make(chan *sarama.ConsumerMessage),
 		errors:   make(chan *sarama.ConsumerError),
 		closer: func() error {
+			cm.Lock()
+			cm.Unlock()
 			if _, exists := cm.partConsumers[topic]; !exists {
 				return fmt.Errorf("partition consumer seems already closed")
 			}
@@ -196,11 +238,50 @@ func (cm *consumerMock) Close() error {
 	return nil
 }
 
+func (cm *consumerMock) waitRequiredConsumersStartup() {
+	doCheck := func() bool {
+		cm.RLock()
+		defer cm.RUnlock()
+
+		for topic := range cm.requiredTopics {
+			_, ok := cm.partConsumers[topic]
+			if !ok {
+				return false
+			}
+		}
+		return true
+	}
+	for !doCheck() {
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (cm *consumerMock) requirePartConsumer(topic string) {
+	cm.requiredTopics[topic] = true
+}
+
 type partConsumerMock struct {
+	offset   int64
 	closer   func() error
 	messages chan *sarama.ConsumerMessage
 	errors   chan *sarama.ConsumerError
 	queue    *queue
+}
+
+func (pcm *partConsumerMock) catchup() int {
+	var numCatchup int
+	for _, msg := range pcm.queue.messagesFromOffset(pcm.offset) {
+		pcm.messages <- &sarama.ConsumerMessage{
+			Key:       []byte(msg.key),
+			Value:     msg.value,
+			Topic:     pcm.queue.topic,
+			Partition: 0,
+			Offset:    msg.offset,
+		}
+		numCatchup++
+	}
+
+	return numCatchup
 }
 
 func (pcm *partConsumerMock) Close() error {
@@ -278,7 +359,7 @@ func (tt *Tester) RegisterGroupGraph(gg *goka.GroupGraph) string {
 
 func (tt *Tester) RegisterView(table goka.Table, c goka.Codec) string {
 	client := tt.nextClient()
-	client.expectedConsumers = append(client.expectedConsumers, string(table))
+	client.requireConsumer(string(table))
 	return client.clientID
 }
 
@@ -289,20 +370,14 @@ func (tt *Tester) RegisterEmitter(topic goka.Stream, codec goka.Codec) {
 }
 
 func (tt *Tester) getOrCreateQueue(topic string) *queue {
-	tt.mQueues.RLock()
-	_, exists := tt.topicQueues[topic]
-	tt.mQueues.RUnlock()
+	tt.mQueues.Lock()
+	defer tt.mQueues.Unlock()
+	queue, exists := tt.topicQueues[topic]
 	if !exists {
-		tt.mQueues.Lock()
-		if _, exists = tt.topicQueues[topic]; !exists {
-			tt.topicQueues[topic] = newQueue(topic)
-		}
-		tt.mQueues.Unlock()
+		queue = newQueue(topic)
+		tt.topicQueues[topic] = queue
 	}
-
-	tt.mQueues.RLock()
-	defer tt.mQueues.RUnlock()
-	return tt.topicQueues[topic]
+	return queue
 }
 
 func (tt *Tester) codecForTopic(topic string) goka.Codec {
@@ -344,5 +419,46 @@ func (tt *Tester) NewQueueTracker(topic string) *QueueTracker {
 	return newQueueTracker(tt, tt.t, topic)
 }
 
+func (tt *Tester) waitStartup() {
+	tt.mClients.RLock()
+	defer tt.mClients.RUnlock()
+
+	for _, client := range tt.clients {
+		client.waitStartup()
+	}
+
+}
+func (tt *Tester) waitForClients() {
+	logger.Printf("waiting for consumers")
+
+	tt.mClients.RLock()
+	defer tt.mClients.RUnlock()
+	for {
+		var totalCatchup int
+		for _, client := range tt.clients {
+			totalCatchup += client.catchup()
+		}
+
+		if totalCatchup == 0 {
+			break
+		}
+	}
+
+	logger.Printf("waiting for consumers done")
+}
+
 func (tt *Tester) Consume(topic string, key string, msg interface{}) {
+	tt.waitStartup()
+	value := reflect.ValueOf(msg)
+	if msg == nil || (value.Kind() == reflect.Ptr && value.IsNil()) {
+		tt.pushMessage(topic, key, nil)
+	} else {
+		data, err := tt.codecForTopic(topic).Encode(msg)
+		if err != nil {
+			panic(fmt.Errorf("Error encoding value %v: %v", msg, err))
+		}
+		tt.pushMessage(topic, key, data)
+	}
+
+	tt.waitForClients()
 }

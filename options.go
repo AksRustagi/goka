@@ -195,6 +195,8 @@ func WithNilHandling(nh NilHandling) ProcessorOption {
 type Tester interface {
 	StorageBuilder() storage.Builder
 	ProducerBuilder() ProducerBuilder
+	ConsumerGroupBuilder() ConsumerGroupBuilder
+	ConsumerBuilder() SaramaConsumerBuilder
 	EmitterProducerBuilder() ProducerBuilder
 	TopicManagerBuilder() TopicManagerBuilder
 	RegisterGroupGraph(*GroupGraph) string
@@ -209,6 +211,8 @@ func WithTester(t Tester) ProcessorOption {
 		o.builders.storage = t.StorageBuilder()
 		o.builders.producer = t.ProducerBuilder()
 		o.builders.topicmgr = t.TopicManagerBuilder()
+		o.builders.consumerGroup = t.ConsumerGroupBuilder()
+		o.builders.consumerSarama = t.ConsumerBuilder()
 		o.partitionChannelSize = 0
 		o.clientID = t.RegisterGroupGraph(gg)
 	}

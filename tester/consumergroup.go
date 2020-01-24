@@ -3,21 +3,26 @@ package tester
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 
 	"github.com/Shopify/sarama"
+	"github.com/lovoo/goka"
 	"github.com/lovoo/goka/multierr"
 )
+
+type queueSession struct {
+	queue  *queue
+	offset int64
+}
 
 // ConsumerGroupSession mocks the consumer group session used for testing
 type ConsumerGroupSession struct {
 	ctx        context.Context
 	generation int32
-	topics     []string
 	claims     map[string]*ConsumerGroupClaim
+	queues     []*queueSession
 
 	consumerGroup *ConsumerGroup
 }
@@ -128,44 +133,57 @@ func (cgs *ConsumerGroupSession) Context() context.Context {
 	return cgs.ctx
 }
 
+const (
+	CGStateStopped goka.State = iota
+	CGStateRebalancing
+	CGStateSetup
+	CGStateConsuming
+	CGStateCleaning
+)
+
 // ConsumerGroup mocks the consumergroup
 type ConsumerGroup struct {
 	errs chan error
 
-	// setting this makes the consume call fail with this error for testing
-	failOnConsume error
-
 	// use the same offset counter for all topics
 	offset            int64
 	currentGeneration int32
+
+	state *goka.Signal
 
 	// messages we sent to the consumergroup and need to wait for
 	mMessages  sync.Mutex
 	messages   map[int64]int64
 	wgMessages sync.WaitGroup
 
-	sessions map[string]*ConsumerGroupSession
+	currentSession *ConsumerGroupSession
 }
 
 // NewConsumerGroup creates a new consumer group
 func NewConsumerGroup(t *testing.T) *ConsumerGroup {
 	return &ConsumerGroup{
 		errs:     make(chan error, 1),
-		sessions: make(map[string]*ConsumerGroupSession),
 		messages: make(map[int64]int64),
+		state:    goka.NewSignal(CGStateStopped, CGStateRebalancing, CGStateSetup, CGStateConsuming, CGStateCleaning).SetState(CGStateStopped),
 	}
 }
+func (cg *ConsumerGroup) catchupAndWait() int {
 
-func (cg *ConsumerGroup) FailOnConsume(err error) {
-	cg.failOnConsume = err
+	if cg.currentSession == nil {
+		panic("There is currently no session. Cannot catchup, but we shouldn't be at this point")
+	}
+
+	for _, topic := range cg.currentSession.topics {
+
+	}
+	return 0
+}
+func (cg *ConsumerGroup) WaitRunning() {
+	<-cg.state.WaitForState(CGStateConsuming)
 }
 
 func (cg *ConsumerGroup) nextOffset() int64 {
 	return atomic.AddInt64(&cg.offset, 1)
-}
-
-func (cg *ConsumerGroup) topicKey(topics []string) string {
-	return strings.Join(topics, ",")
 }
 
 func (cg *ConsumerGroup) markMessage(msg *sarama.ConsumerMessage) {
@@ -185,21 +203,23 @@ func (cg *ConsumerGroup) markMessage(msg *sarama.ConsumerMessage) {
 
 // Consume starts consuming from the consumergroup
 func (cg *ConsumerGroup) Consume(ctx context.Context, topics []string, handler sarama.ConsumerGroupHandler) error {
-	if cg.failOnConsume != nil {
-		return cg.failOnConsume
+	if !cg.state.IsState(CGStateStopped) {
+		return fmt.Errorf("Tried to double-consume this consumer-group, which is not supported by the mock")
 	}
 
+	defer cg.state.SetState(CGStateStopped)
 	if len(topics) == 0 {
 		return fmt.Errorf("no topics specified")
 	}
 
-	key := cg.topicKey(topics)
 	for {
+		cg.state.SetState(CGStateRebalancing)
 		cg.currentGeneration++
 		session := newConsumerGroupSession(ctx, cg.currentGeneration, cg, topics)
 
-		cg.sessions[key] = session
+		cg.currentSession = session
 
+		cg.state.SetState(CGStateSetup)
 		err := handler.Setup(session)
 		if err != nil {
 			return fmt.Errorf("Error setting up: %v", err)
@@ -217,17 +237,19 @@ func (cg *ConsumerGroup) Consume(ctx context.Context, topics []string, handler s
 				return err
 			})
 		}
+		cg.state.SetState(CGStateConsuming)
 
 		errs := new(multierr.Errors)
 
 		// wait for runner errors and collect error
 		errs.Collect(errg.Wait().NilOrError())
+		cg.state.SetState(CGStateCleaning)
 
 		// cleanup and collect errors
 		errs.Collect(handler.Cleanup(session))
 
 		// remove current sessions
-		delete(cg.sessions, key)
+		cg.currentSession = nil
 
 		err = errs.NilOrError()
 		if err != nil {
@@ -260,14 +282,14 @@ func (cg *ConsumerGroup) SendMessage(message *sarama.ConsumerMessage) <-chan str
 
 	message.Offset = cg.nextOffset()
 
-	var messages int
-	for _, session := range cg.sessions {
-		session.SendMessage(message)
-		messages++
-	}
+	// if cg.Me
+	// for _, session := range cg.sessions {
+	// 	session.SendMessage(message)
+	// 	messages++
+	// }
 
-	cg.messages[message.Offset] += int64(messages)
-	cg.wgMessages.Add(messages)
+	// cg.messages[message.Offset] += int64(messages)
+	// cg.wgMessages.Add(messages)
 
 	done := make(chan struct{})
 	go func() {
@@ -298,7 +320,5 @@ func (cg *ConsumerGroup) Close() error {
 
 	cg.offset = 0
 	cg.currentGeneration = 0
-	cg.sessions = make(map[string]*ConsumerGroupSession)
-	cg.failOnConsume = nil
 	return nil
 }
