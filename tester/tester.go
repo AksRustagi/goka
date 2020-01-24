@@ -1,6 +1,7 @@
 package tester
 
 import (
+	"flag"
 	"fmt"
 	"hash"
 	"reflect"
@@ -8,11 +9,33 @@ import (
 	"testing"
 
 	"github.com/lovoo/goka"
-	"github.com/lovoo/goka/mock"
 	"github.com/lovoo/goka/storage"
 
 	"github.com/Shopify/sarama"
 )
+
+// Codec decodes and encodes from and to []byte
+type Codec interface {
+	Encode(value interface{}) (data []byte, err error)
+	Decode(data []byte) (value interface{}, err error)
+}
+
+type debugLogger interface {
+	Printf(s string, args ...interface{})
+}
+
+type nilLogger int
+
+func (*nilLogger) Printf(s string, args ...interface{}) {}
+
+var (
+	debug              = flag.Bool("tester-debug", false, "show debug prints of the tester.")
+	logger debugLogger = new(nilLogger)
+)
+
+// EmitHandler abstracts a function that allows to overwrite kafkamock's Emit function to
+// simulate producer errors
+type EmitHandler func(topic string, key string, value []byte) *goka.Promise
 
 type client struct {
 	clientID      string
@@ -24,9 +47,15 @@ type client struct {
 	expectedConsumers []string
 }
 
+type queuedMessage struct {
+	topic string
+	key   string
+	value []byte
+}
+
 type Tester struct {
 	t        *testing.T
-	producer *mock.Producer
+	producer *producerMock
 	tmgr     goka.TopicManager
 
 	clients map[string]*client
@@ -35,14 +64,15 @@ type Tester struct {
 	mQueues     sync.RWMutex
 	topicQueues map[string]*queue
 	storages    map[string]storage.Storage
+
+	queuedMessages []*queuedMessage
 }
 
-func NewTester(t *testing.T) *Tester {
+func New(t *testing.T) *Tester {
 
-	return &Tester{
-		t:        t,
-		tmgr:     NewMockTopicManager(1, 1),
-		producer: mock.NewProducer(t),
+	tt := &Tester{
+		t:    t,
+		tmgr: NewMockTopicManager(1, 1),
 
 		clients: make(map[string]*client),
 
@@ -50,6 +80,10 @@ func NewTester(t *testing.T) *Tester {
 		topicQueues: make(map[string]*queue),
 		storages:    make(map[string]storage.Storage),
 	}
+
+	tt.producer = newProducerMock(tt.handleEmit)
+
+	return tt
 }
 
 func (tt *Tester) nextClient() *client {
@@ -68,6 +102,11 @@ func (tt *Tester) ConsumerGroupBuilder() goka.ConsumerGroupBuilder {
 		if !exists {
 			return nil, fmt.Errorf("cannot create consumergroup because no client registered with ID: %s", clientID)
 		}
+
+		if client.consumerGroup == nil {
+			return nil, fmt.Errorf("Did not expect a group graph")
+		}
+
 		return client.consumerGroup, nil
 	}
 }
@@ -81,6 +120,32 @@ func (tt *Tester) ConsumerBuilder() goka.SaramaConsumerBuilder {
 
 		return client.consumer, nil
 	}
+}
+
+// EmitterProducerBuilder creates a producer builder used for Emitters.
+// Emitters need to flush when emitting messages.
+func (tt *Tester) EmitterProducerBuilder() goka.ProducerBuilder {
+	builder := tt.ProducerBuilder()
+	return func(b []string, cid string, hasher func() hash.Hash32) (goka.Producer, error) {
+		prod, err := builder(b, cid, hasher)
+		return &flushingProducer{
+			tester:   tt,
+			producer: prod,
+		}, err
+	}
+}
+
+// handleEmit handles an Emit-call on the producerMock.
+// This takes care of queueing calls
+// to handled topics or putting the emitted messages in the emitted-messages-list
+func (tt *Tester) handleEmit(topic string, key string, value []byte) *goka.Promise {
+	promise := goka.NewPromise()
+	tt.pushMessage(topic, key, value)
+	return promise.Finish(nil)
+}
+
+func (tt *Tester) pushMessage(topic string, key string, data []byte) {
+	tt.queuedMessages = append(tt.queuedMessages, &queuedMessage{topic: topic, key: key, value: data})
 }
 
 type consumerMock struct {
@@ -178,36 +243,33 @@ func (tt *Tester) TopicManagerBuilder() goka.TopicManagerBuilder {
 func (tt *Tester) RegisterGroupGraph(gg *goka.GroupGraph) string {
 
 	client := tt.nextClient()
+	// we need to expect a consumer group so we're creating one in the client
+	if gg.GroupTable() != nil || len(gg.InputStreams()) > 0 {
+		client.consumerGroup = NewConsumerGroup(tt.t)
+	}
+
+	// register codecs
 	if gg.GroupTable() != nil {
-		queue := tt.getOrCreateQueue(gg.GroupTable().Topic())
-		client.expectSaramaConsumer(queue)
 		tt.registerCodec(gg.GroupTable().Topic(), gg.GroupTable().Codec())
 	}
 
 	for _, input := range gg.InputStreams() {
-		client.expectGroupConsumer(input.Topic())
 		tt.registerCodec(input.Topic(), input.Codec())
 	}
 
 	for _, output := range gg.OutputStreams() {
 		tt.registerCodec(output.Topic(), output.Codec())
-		tt.getOrCreateQueue(output.Topic())
 	}
+
 	for _, join := range gg.JointTables() {
-		client.expectSimpleConsumer()
-		// tt.getOrCreateQueue(join.Topic()).expectSimpleConsumer()
 		tt.registerCodec(join.Topic(), join.Codec())
 	}
 
 	if loop := gg.LoopStream(); loop != nil {
-		client.expectGroupConsumer(loop.Topic())
-		// tt.getOrCreateQueue(loop.Topic()).expectGroupConsumer()
 		tt.registerCodec(loop.Topic(), loop.Codec())
 	}
 
 	for _, lookup := range gg.LookupTables() {
-		client.expectSimpleConsumer(lookup)
-		// tt.getOrCreateQueue(lookup.Topic()).expectSimpleConsumer()
 		tt.registerCodec(lookup.Topic(), lookup.Codec())
 	}
 
@@ -218,6 +280,12 @@ func (tt *Tester) RegisterView(table goka.Table, c goka.Codec) string {
 	client := tt.nextClient()
 	client.expectedConsumers = append(client.expectedConsumers, string(table))
 	return client.clientID
+}
+
+// RegisterEmitter registers an emitter to be working with the tester.
+func (tt *Tester) RegisterEmitter(topic goka.Stream, codec goka.Codec) {
+	tt.registerCodec(string(topic), codec)
+	tt.getOrCreateQueue(string(topic))
 }
 
 func (tt *Tester) getOrCreateQueue(topic string) *queue {
@@ -252,4 +320,26 @@ func (tt *Tester) registerCodec(topic string, codec goka.Codec) {
 		}
 	}
 	tt.codecs[topic] = codec
+}
+
+func (tt *Tester) TableValue(table goka.Table, key string) interface{} {
+	return nil
+}
+func (tt *Tester) SetTableValue(table goka.Table, key string, value interface{}) {
+}
+
+func (tt *Tester) StorageBuilder() storage.Builder {
+	return func(topic string, partition int32) (storage.Storage, error) {
+		return storage.NewMemory(), nil
+	}
+}
+
+func (tt *Tester) ClearValues() {
+}
+
+func (tt *Tester) NewQueueTracker(topic string) *QueueTracker {
+	return newQueueTracker(tt, tt.t, topic)
+}
+
+func (tt *Tester) Consume(topic string, key string, msg interface{}) {
 }

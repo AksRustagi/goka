@@ -42,3 +42,15 @@ func (q *queue) push(key string, value []byte) {
 	})
 	q.hwm++
 }
+
+func (q *queue) message(offset int) *message {
+	q.Lock()
+	defer q.Unlock()
+	return q.messages[offset]
+}
+
+func (q *queue) size() int {
+	q.Lock()
+	defer q.Unlock()
+	return len(q.messages)
+}
